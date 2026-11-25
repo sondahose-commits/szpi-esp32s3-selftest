@@ -1,0 +1,10 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "board_bsp.c"
+        "selftest_periph.c"
+        "selftest_media.c"
+        "selftest_wireless.c"
+    INCLUDE_DIRS
+        "."
+)

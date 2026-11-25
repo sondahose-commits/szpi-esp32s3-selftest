@@ -1,0 +1,9 @@
+## IDF Component Manager Manifest File
+## 所有外设组件均兼容 ESP-IDF v5.x 传统 I2C 驱动 (driver/i2c.h)，避免新旧 I2C 驱动混用冲突
+dependencies:
+  idf:
+    version: ">=5.1.0,<6.0.0"
+  espressif/esp32-camera: "^2.0.10"
+  espressif/es8311: "~1.0.0"
+  espressif/es7210: "~1.0.0"
+  espressif/esp_lcd_touch_ft5x06: "~1.0.6"
