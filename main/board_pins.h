@@ -41,11 +41,11 @@
 #define PCA9557_BIT_PA_EN       BIT(1)          // IO1: NS4150B 音频功放使能 (高电平有效)
 #define PCA9557_BIT_DVP_PWDN    BIT(2)          // IO2: GC0308 摄像头休眠控制 (低电平工作, 高电平休眠)
 
-/* ---------- 4. 2.0寸 IPS LCD (ST7789, 320x240, SPI2) ---------- */
-#define BSP_LCD_SPI_HOST        SPI2_HOST
+/* ---------- 4. 2.0寸 IPS LCD (ST7789, 320x240, SPI3) ---------- */
+#define BSP_LCD_SPI_HOST        SPI3_HOST
 #define BSP_LCD_H_RES           320
 #define BSP_LCD_V_RES           240
-#define BSP_LCD_PIXEL_CLK_HZ    (40 * 1000 * 1000)
+#define BSP_LCD_PIXEL_CLK_HZ    (80 * 1000 * 1000)
 #define BSP_LCD_SPI_MOSI_IO     GPIO_NUM_40
 #define BSP_LCD_SPI_CLK_IO      GPIO_NUM_41
 #define BSP_LCD_DC_IO           GPIO_NUM_39

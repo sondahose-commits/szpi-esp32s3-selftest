@@ -1,7 +1,12 @@
+# ESP-IDF build outputs & managed components
 build/
 managed_components/
 dependencies.lock
 sdkconfig
 sdkconfig.old
+
+# IDE / OS
 .vscode/
+.idea/
 .DS_Store
+Thumbs.db

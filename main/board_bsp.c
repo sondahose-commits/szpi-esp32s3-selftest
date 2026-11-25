@@ -9,6 +9,7 @@
 #include "driver/i2c.h"
 #include "driver/ledc.h"
 #include "driver/spi_master.h"
+#include "esp_attr.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_lcd_panel_io.h"
@@ -16,6 +17,7 @@
 #include "esp_lcd_panel_vendor.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 static const char *TAG = "board_bsp";
@@ -36,7 +38,8 @@ static bool s_lcd_inited = false;
 static bool s_bl_inited = false;
 static esp_lcd_panel_io_handle_t s_lcd_io = NULL;
 static esp_lcd_panel_handle_t s_lcd_panel = NULL;
-static uint16_t *s_line_buf = NULL; /* 320 * 24 像素行缓冲，用于快速刷屏 */
+static SemaphoreHandle_t s_lcd_tx_done_sem = NULL;
+static uint16_t *s_line_buf = NULL; /* 320 * 24 像素内部 DMA 缓冲，用于刷屏与摄像头推流 */
 
 #define LCD_BUF_LINES   24
 
@@ -264,14 +267,61 @@ esp_err_t bsp_lcd_set_backlight(int brightness_percent)
     return ledc_update_duty(LEDC_LOW_SPEED_MODE, BSP_LCD_BL_LEDC_CH);
 }
 
+static bool IRAM_ATTR lcd_on_color_trans_done(
+    esp_lcd_panel_io_handle_t panel_io,
+    esp_lcd_panel_io_event_data_t *edata,
+    void *user_ctx)
+{
+    (void)panel_io;
+    (void)edata;
+    BaseType_t high_task_wakeup = pdFALSE;
+    SemaphoreHandle_t sem = (SemaphoreHandle_t)user_ctx;
+    if (sem) {
+        xSemaphoreGiveFromISR(sem, &high_task_wakeup);
+    }
+    return (high_task_wakeup == pdTRUE);
+}
+
+static void lcd_draw_sync(int x1, int y1, int x2, int y2, const void *dma_buf)
+{
+    if (!s_lcd_panel || !s_lcd_tx_done_sem) {
+        return;
+    }
+    xSemaphoreTake(s_lcd_tx_done_sem, 0);
+    if (esp_lcd_panel_draw_bitmap(s_lcd_panel, x1, y1, x2, y2, dma_buf) == ESP_OK) {
+        xSemaphoreTake(s_lcd_tx_done_sem, pdMS_TO_TICKS(500));
+    }
+}
+
+static esp_err_t lcd_panel_configure_sequence(void)
+{
+    /* 关键硬件时序 (立创·实战派 ESP32-S3):
+     * LCD_CS 由 PCA9557 IO0 独立控制且初始化后保持低电平。
+     * SPI Mode 2 的 SCLK 空闲为高电平，但 ESP32-S3 在首次 SPI 发送前 SCLK 为低电平。
+     * 必须先保持 LCD_CS=1 执行一次 panel_reset() 让 SCLK 稳定到空闲高电平，
+     * 再拉低 LCD_CS=0 执行 panel_init()，否则 ST7789 会多采 1 个时钟沿导致后续全部命令错位黑屏！ */
+    ESP_RETURN_ON_ERROR(bsp_pca9557_set_lcd_cs(1), TAG, "LCD CS deassert failed");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_reset(s_lcd_panel), TAG, "LCD reset failed");
+    ESP_RETURN_ON_ERROR(bsp_pca9557_set_lcd_cs(0), TAG, "LCD CS assert failed");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_init(s_lcd_panel), TAG, "LCD init failed");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_invert_color(s_lcd_panel, true), TAG, "LCD invert_color failed");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_swap_xy(s_lcd_panel, true), TAG, "LCD swap_xy failed");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_mirror(s_lcd_panel, true, false), TAG, "LCD mirror failed");
+    return ESP_OK;
+}
+
 esp_err_t bsp_lcd_init(void)
 {
     if (s_lcd_inited) {
-        bsp_pca9557_set_lcd_cs(0);
+        ESP_RETURN_ON_ERROR(lcd_panel_configure_sequence(), TAG, "LCD re-init failed");
+        ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(s_lcd_panel, true), TAG, "LCD display on failed");
         return ESP_OK;
     }
 
     ESP_RETURN_ON_ERROR(bsp_lcd_backlight_init(), TAG, "Backlight init failed");
+
+    s_lcd_tx_done_sem = xSemaphoreCreateBinary();
+    ESP_RETURN_ON_FALSE(s_lcd_tx_done_sem != NULL, ESP_ERR_NO_MEM, TAG, "LCD sem alloc failed");
 
     const spi_bus_config_t buscfg = {
         .sclk_io_num = BSP_LCD_SPI_CLK_IO,
@@ -279,7 +329,7 @@ esp_err_t bsp_lcd_init(void)
         .miso_io_num = GPIO_NUM_NC,
         .quadwp_io_num = GPIO_NUM_NC,
         .quadhd_io_num = GPIO_NUM_NC,
-        .max_transfer_sz = BSP_LCD_H_RES * 80 * sizeof(uint16_t),
+        .max_transfer_sz = BSP_LCD_H_RES * BSP_LCD_V_RES * sizeof(uint16_t),
     };
     ESP_RETURN_ON_ERROR(spi_bus_initialize(BSP_LCD_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO), TAG, "SPI bus init failed");
 
@@ -291,6 +341,8 @@ esp_err_t bsp_lcd_init(void)
         .lcd_param_bits = 8,
         .spi_mode = 2,
         .trans_queue_depth = 10,
+        .on_color_trans_done = lcd_on_color_trans_done,
+        .user_ctx = s_lcd_tx_done_sem,
     };
     ESP_RETURN_ON_ERROR(
         esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)BSP_LCD_SPI_HOST, &io_config, &s_lcd_io),
@@ -305,21 +357,10 @@ esp_err_t bsp_lcd_init(void)
         esp_lcd_new_panel_st7789(s_lcd_io, &panel_config, &s_lcd_panel),
         TAG, "esp_lcd_new_panel_st7789 failed");
 
-    /* 必须先通过 PCA9557 拉低 LCD_CS，再发送 ST7789 初始化命令 */
-    ESP_RETURN_ON_ERROR(bsp_pca9557_set_lcd_cs(0), TAG, "LCD CS assert failed");
-    vTaskDelay(pdMS_TO_TICKS(5));
-
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_reset(s_lcd_panel), TAG, "LCD reset failed");
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_init(s_lcd_panel), TAG, "LCD init failed");
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_invert_color(s_lcd_panel, true), TAG, "LCD invert_color failed");
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_swap_xy(s_lcd_panel, true), TAG, "LCD swap_xy failed");
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_mirror(s_lcd_panel, true, false), TAG, "LCD mirror failed");
+    ESP_RETURN_ON_ERROR(lcd_panel_configure_sequence(), TAG, "LCD panel configure failed");
 
     s_line_buf = heap_caps_malloc(BSP_LCD_H_RES * LCD_BUF_LINES * sizeof(uint16_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    if (!s_line_buf) {
-        s_line_buf = malloc(BSP_LCD_H_RES * LCD_BUF_LINES * sizeof(uint16_t));
-    }
-    ESP_RETURN_ON_FALSE(s_line_buf != NULL, ESP_ERR_NO_MEM, TAG, "LCD line buffer alloc failed");
+    ESP_RETURN_ON_FALSE(s_line_buf != NULL, ESP_ERR_NO_MEM, TAG, "LCD DMA buffer alloc failed");
 
     s_lcd_inited = true;
     bsp_lcd_fill_screen(COLOR_BLACK);
@@ -366,7 +407,7 @@ void bsp_lcd_fill_rect(int x, int y, int w, int h, uint16_t color)
     int remain = h;
     while (remain > 0) {
         int chunk = remain < max_rows ? remain : max_rows;
-        esp_lcd_panel_draw_bitmap(s_lcd_panel, x, cur_y, x + w, cur_y + chunk, s_line_buf);
+        lcd_draw_sync(x, cur_y, x + w, cur_y + chunk, s_line_buf);
         cur_y += chunk;
         remain -= chunk;
     }
@@ -379,10 +420,28 @@ void bsp_lcd_fill_screen(uint16_t color)
 
 void bsp_lcd_draw_bitmap_raw(int x, int y, int w, int h, const void *rgb565_be_buf)
 {
-    if (!s_lcd_inited || !rgb565_be_buf || w <= 0 || h <= 0) {
+    if (!s_lcd_inited || !s_line_buf || !rgb565_be_buf || w <= 0 || h <= 0) {
         return;
     }
-    esp_lcd_panel_draw_bitmap(s_lcd_panel, x, y, x + w, y + h, rgb565_be_buf);
+    if (x < 0 || y < 0 || x + w > BSP_LCD_H_RES || y + h > BSP_LCD_V_RES) {
+        return;
+    }
+
+    /* 分条拷贝到内部 DMA 缓冲区后同步发送，彻底避免 PSRAM 帧缓冲导致 SPI DMA 分配失败 */
+    const uint16_t *src = (const uint16_t *)rgb565_be_buf;
+    int max_rows = (BSP_LCD_H_RES * LCD_BUF_LINES) / w;
+    if (max_rows < 1) {
+        max_rows = 1;
+    }
+
+    int cur_y = 0;
+    while (cur_y < h) {
+        int chunk = (h - cur_y < max_rows) ? (h - cur_y) : max_rows;
+        size_t bytes = (size_t)w * (size_t)chunk * sizeof(uint16_t);
+        memcpy(s_line_buf, src + (size_t)cur_y * (size_t)w, bytes);
+        lcd_draw_sync(x, y + cur_y, x + w, y + cur_y + chunk, s_line_buf);
+        cur_y += chunk;
+    }
 }
 
 /* ============================================================================
@@ -520,7 +579,7 @@ void bsp_lcd_draw_char(int x, int y, char c, uint16_t fg, uint16_t bg, int scale
             }
         }
     }
-    esp_lcd_panel_draw_bitmap(s_lcd_panel, x, y, x + cw, y + ch, s_line_buf);
+    lcd_draw_sync(x, y, x + cw, y + ch, s_line_buf);
 }
 
 void bsp_lcd_draw_string(int x, int y, const char *str, uint16_t fg, uint16_t bg, int scale)

@@ -309,7 +309,7 @@ void test_touch_ft6336(test_result_t *res)
                 }
                 /* 在屏幕上画出触摸轨迹点并更新坐标显示 */
                 bsp_lcd_fill_rect((int)last_x - 3, (int)last_y - 3, 7, 7, COLOR_YELLOW);
-                char coord[36];
+                char coord[48];
                 snprintf(coord, sizeof(coord), "X=%3u  Y=%3u  hits=%d  ", last_x, last_y, touch_hits);
                 bsp_lcd_draw_string(12, 218, coord, COLOR_GREEN, COLOR_DARK_BG, 1);
             }
@@ -502,7 +502,7 @@ void test_boot_key_and_ext_gpio(test_result_t *res)
         int rem_sec = (int)((end_us - esp_timer_get_time()) / 1000000LL) + 1;
         if (rem_sec != last_sec) {
             last_sec = rem_sec;
-            char msg[40];
+            char msg[64];
             snprintf(msg, sizeof(msg), "Countdown: %ds  IO10:%s IO11:%s",
                      rem_sec, io10_ok ? "OK" : "NG", io11_ok ? "OK" : "NG");
             bsp_lcd_draw_string(12, 145, msg, COLOR_YELLOW, COLOR_DARK_BG, 1);
